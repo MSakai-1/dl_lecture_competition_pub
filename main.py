@@ -10,6 +10,9 @@ import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import os
 
 
 def set_seed(seed):
@@ -290,20 +293,29 @@ def ResNet50():
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
-        self.resnet = ResNet18()
+        self.resnet = ResNet50()
         self.text_encoder = nn.Linear(vocab_size, 512)
 
+        self.attention_layer = nn.MultiheadAttention(embed_dim=512, num_heads=4)
+
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(1024,  512),
             nn.ReLU(inplace=True),
             nn.Linear(512, n_answer)
         )
 
     def forward(self, image, question):
         image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
+        image_feature_embed = image_feature.unsqueeze(0)
 
-        x = torch.cat([image_feature, question_feature], dim=1)
+
+        question_feature = self.text_encoder(question)  # テキストの特徴量
+        question_embed = question_feature.unsqueeze(0)
+
+        attention, _ = self.attention_layer(question_embed, image_feature_embed, image_feature_embed)
+
+        #x = torch.cat([attention.squeeze(0), question_embed], dim=1)
+        x = torch.cat([attention.squeeze(0), question_embed.squeeze(0)], dim=1)
         x = self.fc(x)
 
         return x
@@ -336,6 +348,7 @@ def train(model, dataloader, optimizer, criterion, device):
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
+
 def eval(model, dataloader, optimizer, criterion, device):
     model.eval()
 
@@ -358,6 +371,26 @@ def eval(model, dataloader, optimizer, criterion, device):
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
+def save_checkpoint(model, optimizer, epoch, filename):
+    state = {
+        'epoch': epoch,
+        'state_dict': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+    }
+    torch.save(state, filename)
+
+def load_checkpoint(model, optimizer, filename):
+    checkpoint = torch.load(filename)
+    model.load_state_dict(checkpoint['state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    start_epoch = checkpoint['epoch'] + 1
+    return model, optimizer, start_epoch
+
+checkpoint_dir = './checkpoints'
+if not os.path.exists(checkpoint_dir):
+    os.makedirs(checkpoint_dir)
+
+
 def main():
     # deviceの設定
     set_seed(42)
@@ -365,20 +398,21 @@ def main():
 
     # dataloader / model
     transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor()
+    	transforms.Resize((224, 224)),
+    	transforms.ColorJitter(brightness=0.8, contrast=0.8, saturation=0.8),
+    	transforms.ToTensor()
     ])
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = 10
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
@@ -390,6 +424,8 @@ def main():
               f"train loss: {train_loss:.4f}\n"
               f"train acc: {train_acc:.4f}\n"
               f"train simple acc: {train_simple_acc:.4f}")
+	checkpoint_filename = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth.tar')
+  	save_checkpoint(model, optimizer, epoch, filename=checkpoint_filename)
 
     # 提出用ファイルの作成
     model.eval()
